@@ -57,8 +57,11 @@ def simplify_postprocess(onnx_model):
     out.inputs.clear()
 
   first_ConvTranspose_node = [node for node in graph.nodes if node.op == "ConvTranspose"][0]
-  concat_node = loop_node(graph, first_ConvTranspose_node, 3)
-  assert concat_node.op == "Concat"
+  for hops in (2, 3):
+      concat_node = loop_node(graph, first_ConvTranspose_node, hops)
+      if concat_node.op == "Concat":
+          break
+  assert concat_node.op == "Concat", f"Expected Concat after ConvTranspose, got {concat_node.op}"
 
   first_node_after_concat = [node for node in graph.nodes if len(node.inputs) != 0 and len(concat_node.outputs) != 0 and node.inputs[0] == concat_node.outputs[0]]
 

@@ -22,18 +22,31 @@
 
 # export CUDA_VISIBLE_DEVICES=2
 
+# export TensorRT_Lib=/lib/aarch64-linux-gnu/
+# export TensorRT_Inc=/usr/include/aarch64-linux-gnu/
+# export TensorRT_Bin=/usr/src/tensorrt/bin/
+
+# export CUDA_Lib=/usr/local/cuda-11.4/targets/aarch64-linux/lib/
+# export CUDA_Inc=/usr/local/cuda-11.4/targets/aarch64-linux/include/
+# export CUDA_Bin=/usr/local/cuda-11.4/bin/
+# export CUDA_HOME=/usr/local/cuda-11.4/
+
+# export CUDNN_Lib=/lib/aarch64-linux-gnu/
+
+# # fp16/int8
+# export DEBUG_PRECISION=fp16
+# export DEBUG_DATA=data
+# export USE_Python=OFF
 export TensorRT_Lib=/lib/aarch64-linux-gnu/
 export TensorRT_Inc=/usr/include/aarch64-linux-gnu/
 export TensorRT_Bin=/usr/src/tensorrt/bin/
 
-export CUDA_Lib=/usr/local/cuda-11.4/targets/aarch64-linux/lib/
-export CUDA_Inc=/usr/local/cuda-11.4/targets/aarch64-linux/include/
-export CUDA_Bin=/usr/local/cuda-11.4/bin/
-export CUDA_HOME=/usr/local/cuda-11.4/
+export CUDA_HOME=/usr/local/cuda
+export CUDA_Lib=${CUDA_HOME}/targets/aarch64-linux/lib/
+export CUDA_Inc=${CUDA_HOME}/targets/aarch64-linux/include/
+export CUDA_Bin=${CUDA_HOME}/bin/
 
 export CUDNN_Lib=/lib/aarch64-linux-gnu/
-
-# fp16/int8
 export DEBUG_PRECISION=fp16
 export DEBUG_DATA=data
 export USE_Python=OFF

@@ -98,7 +98,7 @@ def createNVOutput():
 
         calib_path = 'data/kitti/training/calib/' + str_i + '.txt'
         image_2_path = 'data/kitti/training/image_2/' + str_i + '.png'
-        velo_det_path = 'data/kitti/pred_velo/' + str_i + '.txt'
+        velo_det_path = 'data/kitti/pred/' + str_i + '.txt'
         cam_det_path = 'data/kitti/pred/' + str_i + '.txt'
 
         calib = utils.Calibration(calib_path)

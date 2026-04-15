@@ -21,7 +21,7 @@ import argparse
 import numpy as np
 
 from pathlib import Path
-from onnxsim import simplify
+
 from pcdet.utils import common_utils
 from pcdet.models import build_network
 from pcdet.datasets import DatasetTemplate
@@ -126,7 +126,7 @@ def main():
       dummy_input['batch_size'] = 1
 
       torch.onnx.export(model,       # model being run
-          dummy_input,               # model input (or a tuple for multiple inputs)
+          (dummy_input,{}),               # model input (or a tuple for multiple inputs)
           os.path.join(args.out_dir, "pointpillar_raw.onnx"),  # where to save the model (can be a file or file-like object)
           export_params=True,        # store the trained parameter weights inside the model file
           opset_version=11,          # the ONNX version to export the model to
@@ -139,10 +139,7 @@ def main():
     onnx_raw = onnx.load(os.path.join(args.out_dir, "pointpillar_raw.onnx"))  # load onnx model
     onnx_trim_post = simplify_postprocess(onnx_raw)
 
-    onnx_simp, check = simplify(onnx_trim_post)
-    assert check, "Simplified ONNX model could not be validated"
-
-    onnx_final = simplify_preprocess(onnx_simp)
+    onnx_final = simplify_preprocess(onnx_trim_post)
     onnx.save(onnx_final, os.path.join(args.out_dir, "pointpillar.onnx"))
 
     logger.info('[PASS] ONNX EXPORTED.')
