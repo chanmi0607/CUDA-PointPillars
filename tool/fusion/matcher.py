@@ -55,3 +55,22 @@ def match_pp_with_yolo(pp_preds, yolo_preds, iou_thr=0.5):
         })
 
     return match_results
+
+
+def get_unmatched_yolo(yolo_preds, match_results):
+    """
+    match_results에서 PP와 매칭되지 않은 YOLO 검출만 반환.
+
+    Returns:
+        list of (yolo_idx, yolo_det) — PP box가 하나도 대응되지 않은 YOLO 항목.
+    """
+    matched_indices = {
+        m["yolo_idx"]
+        for m in match_results
+        if m["matched"] and m["yolo_idx"] >= 0
+    }
+    return [
+        (i, yolo)
+        for i, yolo in enumerate(yolo_preds)
+        if i not in matched_indices
+    ]

@@ -17,8 +17,10 @@ from io_utils import (
     ensure_dir,
 )
 from yolo_wrapper import YoloTRTDetector
-from matcher import match_pp_with_yolo
+from matcher import match_pp_with_yolo, get_unmatched_yolo
 from score_fusion import calibrate_pp_scores
+from frustum_fallback import generate_frustum_box, filter_overlapping_fallbacks
+from visualize import save_fusion_vis
 
 # kitti_util은 tool/eval/ 아래에 있으므로 경로 추가
 sys.path.insert(0, str(Path(__file__).parent.parent / "eval"))
@@ -195,6 +197,19 @@ def run_fusion(
     min_match_iou=0.5,
     max_frames=-1,
     debug=False,
+    # ── Frustum Fallback ──────────────────────────
+    frustum_fallback=False,
+    velodyne_dir=None,
+    calib_dir=None,
+    frustum_near=0.5,
+    frustum_far=60.0,
+    frustum_bin_size=1.0,
+    min_yolo_score_fallback=0.3,
+    # ── 시각화 ────────────────────────────────────
+    vis_dir=None,
+    vis_all=False,
+    bev_x_range=(-20, 20),
+    bev_z_range=(0, 25),
 ):
     pred_dir = project_root / "data/kitti/pred"
     save_dir = project_root / save_dir
@@ -221,6 +236,21 @@ def run_fusion(
     t_match_total = 0.0
     t_total = 0.0
 
+    # frustum fallback 통계
+    fb_stats = {"frames": 0, "total": 0, "by_cls": {}, "dedup": 0}
+
+    # frustum fallback 사용 시 필요한 경로 검증
+    if frustum_fallback:
+        if velodyne_dir is None or calib_dir is None:
+            raise ValueError("--frustum_fallback 사용 시 --velodyne_dir, --calib_dir 필수")
+        velodyne_dir = Path(velodyne_dir)
+        calib_dir    = Path(calib_dir)
+
+    # 시각화 디렉토리
+    if vis_dir is not None:
+        vis_dir = Path(vis_dir)
+        ensure_dir(vis_dir)
+
     for idx, frame_id in enumerate(frame_ids):
         pp_txt    = pred_dir / f"{frame_id}.txt"
         img_path  = project_root / image_dir / f"{frame_id}.png"
@@ -228,18 +258,22 @@ def run_fusion(
 
         pp_preds = load_pp_predictions(pp_txt)
 
-        if len(pp_preds) == 0:
-            save_pp_predictions([], save_path)
-            if debug:
-                print(f"[{idx+1}/{len(frame_ids)}] {frame_id}: no PP predictions")
-            continue
-
         if not img_path.exists():
             raise FileNotFoundError(f"Image file not found: {img_path}")
 
         t0 = time.perf_counter()
-        yolo_preds  = detector.predict(img_path)
+        yolo_preds = detector.predict(img_path)
         t1 = time.perf_counter()
+
+        if len(pp_preds) == 0 and not frustum_fallback:
+            save_pp_predictions([], save_path)
+            if debug:
+                print(f"[{idx+1}/{len(frame_ids)}] {frame_id}: no PP predictions")
+            t_yolo_total += (t1 - t0)
+            t_total      += (t1 - t0)
+            total_frames += 1
+            continue
+
         matches     = match_pp_with_yolo(pp_preds, yolo_preds, iou_thr=match_iou_thr)
         fused_preds = calibrate_pp_scores(
             pp_preds,
@@ -249,8 +283,81 @@ def run_fusion(
             min_iou=min_match_iou,
             debug=debug,
         )
+
+        # ── Source 태깅 (시각화용) ────────────────────────────
+        matched_yolo_indices = set()
+        for i, m in enumerate(matches):
+            fused_preds[i]["source"] = "pp_matched" if m["matched"] else "pp"
+            if m["matched"] and m["yolo_idx"] >= 0:
+                matched_yolo_indices.add(m["yolo_idx"])
+
+        # ── Frustum Fallback ──────────────────────────────────
+        n_fallback = 0
+        if frustum_fallback:
+            unmatched_yolo = get_unmatched_yolo(yolo_preds, matches)
+
+            unmatched_yolo = [
+                (yi, yolo) for yi, yolo in unmatched_yolo
+                if float(yolo["score"]) >= min_yolo_score_fallback
+            ]
+
+            if unmatched_yolo:
+                bin_path   = velodyne_dir / f"{frame_id}.bin"
+                calib_path = calib_dir / f"{frame_id}.txt"
+
+                if bin_path.exists() and calib_path.exists():
+                    points = np.fromfile(str(bin_path), dtype=np.float32).reshape(-1, 4)
+                    calib  = kitti_util.Calibration(str(calib_path))
+
+                    raw_fallbacks = []
+                    for yi, yolo_det in unmatched_yolo:
+                        box = generate_frustum_box(
+                            points, calib, yolo_det,
+                            near=frustum_near,
+                            far=frustum_far,
+                            depth_bin_size=frustum_bin_size,
+                            debug=debug,
+                        )
+                        if box is not None:
+                            box["source"] = "fallback"
+                            raw_fallbacks.append(box)
+
+                    # BEV 중복 제거: PP와 겹치는 fallback 제거
+                    before_dedup = len(raw_fallbacks)
+                    fallbacks = filter_overlapping_fallbacks(
+                        raw_fallbacks, fused_preds, debug=debug
+                    )
+                    fb_stats["dedup"] += (before_dedup - len(fallbacks))
+
+                    fused_preds.extend(fallbacks)
+                    n_fallback = len(fallbacks)
+                elif debug:
+                    print(f"[FRUSTUM] {frame_id}: bin or calib not found, skip")
+
+            # 통계 갱신
+            if n_fallback > 0:
+                fb_stats["frames"] += 1
+                fb_stats["total"]  += n_fallback
+                for fb in fallbacks:
+                    cls = fb["cls_name"]
+                    fb_stats["by_cls"][cls] = fb_stats["by_cls"].get(cls, 0) + 1
+
         t2 = time.perf_counter()
         save_pp_predictions(fused_preds, save_path)
+
+        # ── 시각화 저장 ───────────────────────────────────────
+        if vis_dir is not None and (n_fallback > 0 or vis_all):
+            vis_path = vis_dir / f"{frame_id}.png"
+            save_fusion_vis(
+                img_path=img_path,
+                yolo_preds=yolo_preds,
+                fused_preds=fused_preds,
+                matched_yolo_indices=matched_yolo_indices,
+                save_path=vis_path,
+                frame_id=frame_id,
+                bev_x_range=bev_x_range,
+                bev_z_range=bev_z_range,
+            )
 
         t_yolo_total  += (t1 - t0)
         t_match_total += (t2 - t1)
@@ -260,8 +367,27 @@ def run_fusion(
         if idx % 50 == 0 or debug:
             print(
                 f"[{idx+1}/{len(frame_ids)}] frame={frame_id} "
-                f"PP={len(pp_preds)} YOLO={len(yolo_preds)} saved={save_path.name}"
+                f"PP={len(pp_preds)} YOLO={len(yolo_preds)} "
+                f"fallback={n_fallback} saved={save_path.name}"
             )
+
+    # ── Frustum Fallback 통계 출력 ────────────────────────────
+    if frustum_fallback and fb_stats["total"] > 0:
+        print(f"\n[FRUSTUM STATS]")
+        print(f"  Frames with fallback : {fb_stats['frames']}/{total_frames}")
+        print(f"  Total fallback boxes : {fb_stats['total']}")
+        cls_str = ", ".join(f"{k}={v}" for k, v in sorted(fb_stats["by_cls"].items()))
+        print(f"  By class             : {cls_str}")
+        if fb_stats["frames"] > 0:
+            print(f"  Avg per frame (where applied): "
+                  f"{fb_stats['total']/fb_stats['frames']:.2f}")
+        print(f"  BEV dedup removed    : {fb_stats['dedup']}")
+    elif frustum_fallback:
+        print(f"\n[FRUSTUM STATS] No fallback boxes generated.")
+
+    if vis_dir is not None:
+        n_vis = fb_stats["frames"] if not vis_all else total_frames
+        print(f"[VIS] {n_vis} frames saved to {vis_dir}")
 
     if total_frames > 0:
         avg_yolo  = t_yolo_total  / total_frames * 1000
@@ -329,6 +455,50 @@ def main():
         help="Evaluate only objects within this distance (camera z, meters). -1 = no limit.",
     )
 
+    # ── Frustum Fallback ──────────────────────────────────────
+    parser.add_argument(
+        "--frustum_fallback",
+        action="store_true",
+        help="YOLO-only 검출에 대해 frustum 기반 BEV box를 생성해 예측에 추가",
+    )
+    parser.add_argument(
+        "--frustum_near",
+        type=float,
+        default=0.5,
+        help="Frustum near plane 깊이 (m)",
+    )
+    parser.add_argument(
+        "--frustum_far",
+        type=float,
+        default=60.0,
+        help="Frustum far plane 깊이 (m)",
+    )
+    parser.add_argument(
+        "--frustum_bin_size",
+        type=float,
+        default=1.0,
+        help="Depth 히스토그램 bin 크기 (m)",
+    )
+    parser.add_argument(
+        "--min_yolo_score_fallback",
+        type=float,
+        default=0.3,
+        help="Frustum fallback을 적용할 YOLO confidence 최소값 (기존 --min_yolo_score와 별개)",
+    )
+
+    # ── 시각화 ────────────────────────────────────────────────
+    parser.add_argument(
+        "--vis_dir",
+        type=str,
+        default=None,
+        help="시각화 이미지 저장 디렉토리. 지정 시 fallback 프레임에 대해 이미지+BEV PNG 생성",
+    )
+    parser.add_argument(
+        "--vis_all",
+        action="store_true",
+        help="fallback이 없는 프레임도 시각화 저장 (기본: fallback 있는 프레임만)",
+    )
+
     args = parser.parse_args()
 
     project_root = Path(args.project_root).resolve()
@@ -360,6 +530,14 @@ def main():
         print("[INFO] Step 4: Evaluate baseline PP")
         run_evaluate(project_root, "data/kitti/pred_baseline", max_dist=args.max_dist)
 
+    # BEV 시각화 범위: max_dist 기반 자동 설정
+    if args.max_dist > 0:
+        bev_z = (0, args.max_dist * 1.25)
+        bev_x = (-args.max_dist * 0.75, args.max_dist * 0.75)
+    else:
+        bev_z = (0, 50)
+        bev_x = (-30, 30)
+
     print("[INFO] Step 5: Run YOLO + Fusion")
     yolo_ms_per_frame, yolo_num_frames = run_fusion(
         project_root=project_root,
@@ -378,6 +556,17 @@ def main():
         min_match_iou=args.min_match_iou,
         max_frames=args.max_frames,
         debug=args.debug,
+        frustum_fallback=args.frustum_fallback,
+        velodyne_dir=args.velodyne_dir,
+        calib_dir=args.calib_dir,
+        frustum_near=args.frustum_near,
+        frustum_far=args.frustum_far,
+        frustum_bin_size=args.frustum_bin_size,
+        min_yolo_score_fallback=args.min_yolo_score_fallback,
+        vis_dir=args.vis_dir,
+        vis_all=args.vis_all,
+        bev_x_range=bev_x,
+        bev_z_range=bev_z,
     )
 
     if not args.skip_fused_eval:
