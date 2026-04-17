@@ -31,7 +31,8 @@ def evaluate(label_path,
              current_class=0,
              coco=False,
              score_thresh=-1,
-             max_dist=-1):
+             max_dist=-1,
+             pr_save_dir=None):
     val_image_ids = _read_imageset_file(label_split_file)
     dt_annos = kitti.get_label_annos(result_path, val_image_ids)
     if score_thresh > 0:
@@ -43,7 +44,8 @@ def evaluate(label_path,
     if coco:
         print(get_coco_eval_result(gt_annos, dt_annos, current_class))
     else:
-        print(get_official_eval_result(gt_annos, dt_annos, current_class))
+        print(get_official_eval_result(gt_annos, dt_annos, current_class,
+                                       pr_save_dir=pr_save_dir))
 
 
 if __name__ == '__main__':

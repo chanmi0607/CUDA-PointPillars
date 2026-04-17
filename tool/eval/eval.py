@@ -1,5 +1,6 @@
 import io as sysio
 import time
+from pathlib import Path
 
 import numba
 import numpy as np
@@ -525,6 +526,11 @@ def eval_class(gt_annos,
         [num_class, num_difficulty, num_minoverlap, N_SAMPLE_PTS])
     aos = np.zeros([num_class, num_difficulty, num_minoverlap, N_SAMPLE_PTS])
     all_thresholds = np.zeros([num_class, num_difficulty, num_minoverlap, N_SAMPLE_PTS])
+    # TP/FP/FN 집계용 (가장 낮은 threshold 기준, 즉 최대 recall 지점)
+    total_tp = np.zeros([num_class, num_difficulty, num_minoverlap], dtype=np.int64)
+    total_fp = np.zeros([num_class, num_difficulty, num_minoverlap], dtype=np.int64)
+    total_fn = np.zeros([num_class, num_difficulty, num_minoverlap], dtype=np.int64)
+    total_gt = np.zeros([num_class, num_difficulty], dtype=np.int64)
     for m, current_class in enumerate(current_classes):
         for l, difficulty in enumerate(difficultys):
             rets = _prepare_data(gt_annos, dt_annos, current_class, difficulty)
@@ -588,6 +594,10 @@ def eval_class(gt_annos,
                         precision[m, l, k, i:], axis=-1)
                     if compute_aos:
                         aos[m, l, k, i] = np.max(aos[m, l, k, i:], axis=-1)
+                if len(thresholds) > 0:
+                    total_tp[m, l, k] = pr[-1, 0]
+                    total_fp[m, l, k] = pr[-1, 1]
+                    total_fn[m, l, k] = pr[-1, 2]
 
     ret_dict = {
         # "recall": recall, # [num_class, num_difficulty, num_minoverlap, N_SAMPLE_PTS]
@@ -595,6 +605,9 @@ def eval_class(gt_annos,
         "orientation": aos,
         "thresholds": all_thresholds,
         "min_overlaps": min_overlaps,
+        "tp": total_tp,
+        "fp": total_fp,
+        "fn": total_fn,
     }
     return ret_dict
 
@@ -715,12 +728,70 @@ def print_str(value, *arg, sstream=None):
     print(value, *arg, file=sstream)
     return sstream.getvalue()
 
+def save_pr_curves(metrics, current_classes, class_to_name, min_overlaps,
+                   difficultys, save_dir):
+    """
+    metrics["3d"]["precision"] 데이터로 PR Curve PNG를 생성·저장.
+
+    파일명: pr_curve_<ClassName>.png  (클래스별 1장)
+    각 그래프: Easy / Moderate / Hard 3개 라인, minoverlap=0 (moderate 기준)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[PR] matplotlib not installed — skipping PR curve plot")
+        return
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    recall = np.linspace(0, 1, 41)          # 41 sample points
+    diff_names = {0: "Easy", 1: "Moderate", 2: "Hard"}
+    diff_colors = {0: "green", 1: "blue", 2: "red"}
+    minoverlap_idx = 0                       # moderate threshold (index 0)
+
+    for j, curcls in enumerate(current_classes):
+        cls_name = class_to_name[curcls]
+        overlap_val = min_overlaps[minoverlap_idx, 2, j]   # metric=2 → 3D
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.set_title(f"PR Curve — {cls_name}  (3D IoU≥{overlap_val:.2f})")
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+        for d in difficultys:
+            prec = metrics["3d"]["precision"][j, d, minoverlap_idx, :]  # (41,)
+            # 0-padded 뒤쪽 구간은 그리지 않음 — 마지막 non-zero index까지만
+            last = np.max(np.where(prec > 0)[0]) + 1 if np.any(prec > 0) else 1
+            mAP_val = get_mAP_v2(prec)
+            label = f"{diff_names.get(d, d)} (mAP={float(mAP_val):.2f})"
+            ax.plot(recall[:last], prec[:last],
+                    label=label,
+                    color=diff_colors.get(d, "gray"),
+                    linewidth=1.8)
+            ax.fill_between(recall[:last], prec[:last], alpha=0.07,
+                            color=diff_colors.get(d, "gray"))
+
+        ax.legend(loc="upper right")
+        out_path = save_dir / f"pr_curve_{cls_name}.png"
+        fig.tight_layout()
+        fig.savefig(str(out_path), dpi=120)
+        plt.close(fig)
+        print(f"[PR] Saved: {out_path}")
+
+
 def get_official_eval_result(gt_annos,
                              dt_annos,
                              current_classes,
                              difficultys=[0, 1, 2],
                              z_axis=1,
-                             z_center=1.0):
+                             z_center=1.0,
+                             pr_save_dir=None):
     """
         gt_annos and dt_annos must contains following keys:
         [bbox, location, dimensions, rotation_y, score]
@@ -780,17 +851,26 @@ def get_official_eval_result(gt_annos,
             mAPbev = ", ".join(f"{v:.2f}" for v in mAPbev)
             mAP3d = get_mAP_v2(metrics["3d"]["precision"][j, :, i])
             mAP3d = ", ".join(f"{v:.2f}" for v in mAP3d)
+            tps = ", ".join(f"{int(metrics['3d']['tp'][j, d, i])}" for d in range(len(difficultys)))
+            fps = ", ".join(f"{int(metrics['3d']['fp'][j, d, i])}" for d in range(len(difficultys)))
+            fns = ", ".join(f"{int(metrics['3d']['fn'][j, d, i])}" for d in range(len(difficultys)))
+            
             result += print_str(
                 (f"{class_to_name[curcls]} "
                  "AP(Average Precision)@{:.2f}, {:.2f}, {:.2f}:".format(*min_overlaps[i, :, j])))
             result += print_str(f"bbox AP:{mAPbbox}")
             result += print_str(f"bev  AP:{mAPbev}")
             result += print_str(f"3d   AP:{mAP3d}")
+            result += print_str(f"     [3D Stats] TP: [{tps}] | FP: [{fps}] | FN: [{fns}]")
+            
             if compute_aos:
                 mAPaos = get_mAP_v2(metrics["bbox"]["orientation"][j, :, i])
                 mAPaos = ", ".join(f"{v:.2f}" for v in mAPaos)
                 result += print_str(f"aos  AP:{mAPaos}")
 
+    if pr_save_dir is not None:
+        save_pr_curves(metrics, current_classes, class_to_name, min_overlaps,
+                       difficultys, pr_save_dir)
 
     return result
 

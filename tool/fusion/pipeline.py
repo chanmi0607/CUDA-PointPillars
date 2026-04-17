@@ -27,6 +27,38 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "eval"))
 import kitti_util
 
 
+KITTI_CLS_NAMES = {"Car", "Pedestrian", "Cyclist", "Van", "Person_sitting",
+                   "Truck", "Tram", "Misc"}
+
+def load_gt_boxes(label_path):
+    """
+    KITTI label 파일을 읽어 GT 박스 리스트 반환.
+    형식: type trunc occ alpha x1 y1 x2 y2 h w l x y z ry
+    """
+    boxes = []
+    label_path = Path(label_path)
+    if not label_path.exists():
+        return boxes
+    with open(label_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 15:
+                continue
+            cls_name = parts[0]
+            if cls_name not in KITTI_CLS_NAMES:
+                continue
+            h, w, l = float(parts[8]), float(parts[9]), float(parts[10])
+            x, y, z = float(parts[11]), float(parts[12]), float(parts[13])
+            ry = float(parts[14])
+            boxes.append({
+                "cls_name":   cls_name,
+                "location":   [x, y, z],
+                "dimensions": [h, w, l],
+                "rotation_y": ry,
+            })
+    return boxes
+
+
 def get_fov_flag(points, calib, img_shape):
     """OpenPCDet calibration_kitti.py 의 rect_to_img + get_fov_flag와 동일한 로직."""
     # lidar → rect (OpenPCDet: lidar_to_rect)
@@ -146,26 +178,29 @@ def run_pointpillars(project_root, velodyne_dir, pred_dir, skip_pp=False,
     return ms_per_frame, num_bins
 
 
-def run_kitti_format(project_root):
+def run_kitti_format(project_root, split_file="tool/eval/val.txt"):
     run_command(
-        ["python3", "tool/eval/kitti_format.py"],
+        ["python3", "tool/eval/kitti_format.py", "--split_file", split_file],
         cwd=str(project_root),
     )
 
 
-def run_evaluate(project_root, result_path, max_dist=-1):
+def run_evaluate(project_root, result_path, max_dist=-1, pr_save_dir=None,
+                  split_file="tool/eval/val.txt"):
     cmd = [
         "python3",
         "tool/eval/evaluate.py",
         "evaluate",
         "--label_path=data/kitti/training/label_2/",
         f"--result_path={result_path}",
-        "--label_split_file=tool/eval/val.txt",
+        f"--label_split_file={split_file}",
         "--current_class=0,1,2",
         "--coco=False",
     ]
     if max_dist > 0:
         cmd.append(f"--max_dist={max_dist}")
+    if pr_save_dir is not None:
+        cmd.append(f"--pr_save_dir={pr_save_dir}")
     run_command(cmd, cwd=str(project_root))
 
 
@@ -205,11 +240,17 @@ def run_fusion(
     frustum_far=60.0,
     frustum_bin_size=1.0,
     min_yolo_score_fallback=0.3,
+    # ── DBSCAN / Heatmap 파라미터 ────────────────
+    dbscan_eps=0.7,
+    dbscan_min_samples=3,
+    heatmap_grid_size=0.15,
+    heatmap_yaw_step=5,
     # ── 시각화 ────────────────────────────────────
     vis_dir=None,
     vis_all=False,
     bev_x_range=(-20, 20),
     bev_z_range=(0, 25),
+    label_dir=None,
 ):
     pred_dir = project_root / "data/kitti/pred"
     save_dir = project_root / save_dir
@@ -246,10 +287,11 @@ def run_fusion(
         velodyne_dir = Path(velodyne_dir)
         calib_dir    = Path(calib_dir)
 
-    # 시각화 디렉토리
+    # 시각화 디렉토리 / GT 레이블 경로
     if vis_dir is not None:
         vis_dir = Path(vis_dir)
         ensure_dir(vis_dir)
+    label_dir = Path(label_dir) if label_dir is not None else None
 
     for idx, frame_id in enumerate(frame_ids):
         pp_txt    = pred_dir / f"{frame_id}.txt"
@@ -281,14 +323,33 @@ def run_fusion(
             gamma=gamma,
             min_yolo_score=min_yolo_score,
             min_iou=min_match_iou,
+            drop_unmatched=False,
+            unmatched_penalty=0.8,
             debug=debug,
         )
 
         # ── Source 태깅 (시각화용) ────────────────────────────
+        # drop_unmatched=True 이면 calibrate_pp_scores 가 일부 박스를 삭제하므로
+        # matches 의 순번(i)과 fused_preds 의 인덱스가 불일치한다.
+        # score_fusion 의 드롭 조건을 그대로 재현해 살아남은 match 만 추린 뒤
+        # fused_preds 와 zip 으로 대응시킨다.
         matched_yolo_indices = set()
-        for i, m in enumerate(matches):
-            fused_preds[i]["source"] = "pp_matched" if m["matched"] else "pp"
-            if m["matched"] and m["yolo_idx"] >= 0:
+        surviving_matches = []
+        for m in matches:
+            if not m["matched"]:
+                # unmatched → drop_unmatched=True 이므로 삭제됨
+                continue
+            yolo_score = float(m["yolo_obj"]["score"])
+            iou = float(m["iou"])
+            if yolo_score < min_yolo_score or iou < min_match_iou:
+                # weak match → drop_unmatched=True 이므로 삭제됨
+                continue
+            surviving_matches.append(m)
+
+        # fused_preds 의 앞부분(fallback 추가 전)은 surviving_matches 와 1:1 대응
+        for fused_obj, m in zip(fused_preds[:len(surviving_matches)], surviving_matches):
+            fused_obj["source"] = "pp_matched"
+            if m["yolo_idx"] >= 0:
                 matched_yolo_indices.add(m["yolo_idx"])
 
         # ── Frustum Fallback ──────────────────────────────────
@@ -315,6 +376,10 @@ def run_fusion(
                             points, calib, yolo_det,
                             near=frustum_near,
                             far=frustum_far,
+                            dbscan_eps=dbscan_eps,
+                            dbscan_min_samples=dbscan_min_samples,
+                            heatmap_grid_size=heatmap_grid_size,
+                            heatmap_yaw_step=heatmap_yaw_step,
                             depth_bin_size=frustum_bin_size,
                             debug=debug,
                         )
@@ -348,6 +413,9 @@ def run_fusion(
         # ── 시각화 저장 ───────────────────────────────────────
         if vis_dir is not None and (n_fallback > 0 or vis_all):
             vis_path = vis_dir / f"{frame_id}.png"
+            gt_boxes = None
+            if label_dir is not None:
+                gt_boxes = load_gt_boxes(label_dir / f"{frame_id}.txt")
             save_fusion_vis(
                 img_path=img_path,
                 yolo_preds=yolo_preds,
@@ -357,6 +425,7 @@ def run_fusion(
                 frame_id=frame_id,
                 bev_x_range=bev_x_range,
                 bev_z_range=bev_z_range,
+                gt_boxes=gt_boxes,
             )
 
         t_yolo_total  += (t1 - t0)
@@ -408,7 +477,7 @@ def main():
     parser.add_argument("--project_root",       type=str, default=".")
     parser.add_argument("--yolo_engine",        type=str, required=True)
     parser.add_argument("--image_dir",          type=str, default="data/kitti/training/image_2")
-    parser.add_argument("--split_file",         type=str, default="tool/eval/val.txt")
+    parser.add_argument("--split_file",         type=str, default="tool/eval/val_occ0.txt")
     parser.add_argument("--save_dir",           type=str, default="data/kitti/fused_pred")
 
     parser.add_argument("--skip_pp",            action="store_true")
@@ -485,6 +554,30 @@ def main():
         default=0.3,
         help="Frustum fallback을 적용할 YOLO confidence 최소값 (기존 --min_yolo_score와 별개)",
     )
+    parser.add_argument(
+        "--dbscan_eps",
+        type=float,
+        default=0.7,
+        help="DBSCAN 이웃 반경 [m] (frustum 클러스터링)",
+    )
+    parser.add_argument(
+        "--dbscan_min_samples",
+        type=int,
+        default=3,
+        help="DBSCAN 코어 포인트 최소 이웃 수",
+    )
+    parser.add_argument(
+        "--heatmap_grid_size",
+        type=float,
+        default=0.15,
+        help="Heatmap BEV grid 해상도 [m]",
+    )
+    parser.add_argument(
+        "--heatmap_yaw_step",
+        type=int,
+        default=5,
+        help="Heatmap yaw 탐색 간격 [deg]",
+    )
 
     # ── 시각화 ────────────────────────────────────────────────
     parser.add_argument(
@@ -497,6 +590,12 @@ def main():
         "--vis_all",
         action="store_true",
         help="fallback이 없는 프레임도 시각화 저장 (기본: fallback 있는 프레임만)",
+    )
+    parser.add_argument(
+        "--label_dir",
+        type=str,
+        default="/home/a/OpenPCDet_my/data/kitti/training/label_2",
+        help="GT label 디렉토리 (BEV IoU 표시용). 미지정 시 IoU 표시 안 함.",
     )
 
     args = parser.parse_args()
@@ -520,15 +619,19 @@ def main():
         fov_filter=args.fov_filter,
     )
 
-    print("[INFO] Step 2: Convert PP outputs to KITTI format")
-    run_kitti_format(project_root)
+    if not args.skip_pp:
+        print("[INFO] Step 2: Convert PP outputs to KITTI format")
+        run_kitti_format(project_root, split_file=args.split_file)
+    else:
+        print("[INFO] Step 2: Skipped kitti_format (--skip_pp)")
 
     print("[INFO] Step 3: Backup baseline predictions")
     copy_baseline_pred(project_root)
 
     if not args.skip_baseline_eval:
         print("[INFO] Step 4: Evaluate baseline PP")
-        run_evaluate(project_root, "data/kitti/pred_baseline", max_dist=args.max_dist)
+        run_evaluate(project_root, "data/kitti/pred_baseline", max_dist=args.max_dist,
+                     split_file=args.split_file)
 
     # BEV 시각화 범위: max_dist 기반 자동 설정
     if args.max_dist > 0:
@@ -563,15 +666,22 @@ def main():
         frustum_far=args.frustum_far,
         frustum_bin_size=args.frustum_bin_size,
         min_yolo_score_fallback=args.min_yolo_score_fallback,
+        dbscan_eps=args.dbscan_eps,
+        dbscan_min_samples=args.dbscan_min_samples,
+        heatmap_grid_size=args.heatmap_grid_size,
+        heatmap_yaw_step=args.heatmap_yaw_step,
         vis_dir=args.vis_dir,
         vis_all=args.vis_all,
         bev_x_range=bev_x,
         bev_z_range=bev_z,
+        label_dir=args.label_dir,
     )
 
     if not args.skip_fused_eval:
         print("[INFO] Step 6: Evaluate fused PP")
-        run_evaluate(project_root, args.save_dir, max_dist=args.max_dist)
+        pr_save = str(project_root / args.save_dir / "pr_curves")
+        run_evaluate(project_root, args.save_dir, max_dist=args.max_dist,
+                     pr_save_dir=pr_save, split_file=args.split_file)
 
     if pp_ms_per_frame is not None and yolo_ms_per_frame is not None:
         total_ms = pp_ms_per_frame + yolo_ms_per_frame

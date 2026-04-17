@@ -1,4 +1,5 @@
 import os
+import argparse
 import pickle
 import numpy as np
 import kitti_util as utils
@@ -91,8 +92,8 @@ def _read_imageset_file(path):
         lines = f.readlines()
     return [int(line) for line in lines]
 
-def createNVOutput():
-    val_image_ids = _read_imageset_file('tool/eval/val.txt')
+def createNVOutput(split_file='tool/eval/val.txt'):
+    val_image_ids = _read_imageset_file(split_file)
     for image_i in val_image_ids:
         str_i = str(image_i).zfill(6)
 
@@ -197,5 +198,9 @@ def createPCDetOutput():
                     the_file.write("\n")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--split_file", type=str, default="tool/eval/val.txt")
+    args = parser.parse_args()
+
     createPCDetOutput()
-    createNVOutput()
+    createNVOutput(split_file=args.split_file)
