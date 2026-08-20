@@ -58,9 +58,9 @@ def main():
     parser.add_argument("--label_dir", type=str,
                         default="/home/a/OpenPCDet_my/data/kitti/training/label_2")
     parser.add_argument("--split_file", type=str,
-                        default="tool/eval/val.txt")
+                        default="/home/a/OpenPCDet/data/kitti/ImageSets/train.txt")
     parser.add_argument("--out_file", type=str,
-                        default="tool/eval/val_easy.txt")
+                        default="tool/eval/train_occ0.txt")
     args = parser.parse_args()
 
     label_dir = Path(args.label_dir)

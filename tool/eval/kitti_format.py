@@ -108,6 +108,14 @@ def createNVOutput(split_file='tool/eval/val.txt'):
 
         print(str_i, " ", img_width, " ", img_height)
 
+        # Idempotency guard: createNVOutput converts velo detections to KITTI
+        # format in place, so a file already converted (first token is a class
+        # name like "Car") must be skipped to avoid re-parsing errors.
+        with open(velo_det_path) as _f:
+            _first = _f.readline().split()
+        if _first and not _first[0].lstrip('-').replace('.', '', 1).isdigit():
+            continue
+
         # detection in velodyne coordinate - x, y, z, w, l, h, rt, id, score
         velo_det = np.loadtxt(velo_det_path).reshape(-1,9)
         img_boxs = calib.project_velo_to_rect(velo_det[:,:3])

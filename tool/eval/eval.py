@@ -8,6 +8,11 @@ from scipy.interpolate import interp1d
 
 from pcdet.datasets.kitti.kitti_object_eval_python.rotate_iou import rotate_iou_gpu_eval
 
+# When True, clean_data ignores occlusion / truncation / min-height difficulty
+# gating so that GT/DT are selected purely by class (distance is applied
+# separately upstream via filter_annos_by_distance). See evaluate.py --dist_only.
+DISTANCE_ONLY = False
+
 def get_mAP(prec):
     sums = 0
     for i in range(0, len(prec), 4):
@@ -65,7 +70,8 @@ def clean_data(gt_anno, dt_anno, current_class, difficulty):
         else:
             valid_class = -1
         ignore = False
-        if ((gt_anno["occluded"][i] > MAX_OCCLUSION[difficulty])
+        if not DISTANCE_ONLY and (
+                (gt_anno["occluded"][i] > MAX_OCCLUSION[difficulty])
                 or (gt_anno["truncated"][i] > MAX_TRUNCATION[difficulty])
                 or (height <= MIN_HEIGHT[difficulty])):
             # if gt_anno["difficulty"][i] > difficulty or gt_anno["difficulty"][i] == -1:
@@ -86,7 +92,7 @@ def clean_data(gt_anno, dt_anno, current_class, difficulty):
         else:
             valid_class = -1
         height = abs(dt_anno["bbox"][i, 3] - dt_anno["bbox"][i, 1])
-        if height < MIN_HEIGHT[difficulty]:
+        if not DISTANCE_ONLY and height < MIN_HEIGHT[difficulty]:
             ignored_dt.append(1)
         elif valid_class == 1:
             ignored_dt.append(0)

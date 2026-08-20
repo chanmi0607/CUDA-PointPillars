@@ -15,6 +15,7 @@ frustum-pointnets 논문의 아이디어 + 실용적 구현:
   - /home/a/frustum/: DBSCAN + heatmap 구현 참고
 """
 
+import cv2
 import numpy as np
 
 # ─────────────────────────────────────────────────────────────
@@ -23,7 +24,7 @@ import numpy as np
 # ─────────────────────────────────────────────────────────────
 CLASS_PRIOR = {
     "Car":        {"l": 3.88, "w": 1.63, "h": 1.53},
-    "Pedestrian": {"l": 0.84, "w": 0.66, "h": 1.76},
+    "Pedestrian": {"l": 0.70, "w": 0.50, "h": 1.73},
     "Cyclist":    {"l": 1.76, "w": 0.60, "h": 1.74},
 }
 
@@ -94,6 +95,32 @@ def _estimate_depth_from_bbox(cls_name: str, bbox2d: list, focal: float) -> floa
     return focal * prior["h"] / bbox_h
 
 
+def _estimate_depth_from_center_points(
+    pts_cam: np.ndarray, calib, bbox2d: list, ratio: float = 0.3
+) -> float | None:
+    """
+    2D box 중앙 영역에 투영된 LiDAR 점들의 median depth를 반환.
+
+    ratio: bbox 폭/높이 대비 중앙 영역 크기 (0.3 = 중심 30%)
+    점이 부족하면 None 반환 → 호출부에서 fallback.
+    """
+    x1, y1, x2, y2 = bbox2d
+    bw, bh = x2 - x1, y2 - y1
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    half_w, half_h = bw * ratio / 2.0, bh * ratio / 2.0
+
+    pts_img, depths = _cam_rect_to_img(pts_cam, calib)
+
+    mask = (
+        (depths > 0)
+        & (pts_img[:, 0] >= cx - half_w) & (pts_img[:, 0] <= cx + half_w)
+        & (pts_img[:, 1] >= cy - half_h) & (pts_img[:, 1] <= cy + half_h)
+    )
+    if mask.sum() < 2:
+        return None
+    return float(np.median(depths[mask]))
+
+
 def _estimate_heading_ego(cx: float, cz: float) -> float:
     """객체가 ego vehicle을 향해 있다고 가정."""
     return float(np.arctan2(cx, cz))
@@ -138,52 +165,89 @@ def _rotate_pc_along_y(pts: np.ndarray, rot_angle: float) -> np.ndarray:
 # DBSCAN 클러스터링 (foreground/background 분리)
 # ─────────────────────────────────────────────────────────────
 
-def _dbscan_cluster(pts_rect: np.ndarray, eps=0.7, min_samples=3, min_points=3):
+# def _dbscan_cluster(pts_rect: np.ndarray, eps=0.7, min_samples=3, min_points=3):
+#     """
+#     DBSCAN으로 frustum 포인트를 클러스터링하여 foreground 클러스터 선택.
+
+#     선택 전략 (frustum-pointnets의 masking에 대응):
+#       1. 포인트 수가 가장 많은 클러스터
+#       2. 동률이면 depth(z) 중앙값이 가장 가까운 클러스터
+
+#     Returns:
+#         selected_pts: (M, 3) 선택된 클러스터 포인트
+#         all_labels:   (N,)  클러스터 레이블 (-1 = noise)
+#         n_clusters:   int
+#     """
+#     n = len(pts_rect)
+#     if n < min_points:
+#         return pts_rect, np.zeros(n, dtype=np.int32), 0
+
+#     try:
+#         from sklearn.cluster import DBSCAN
+#     except ImportError:
+#         # sklearn 없으면 전체 포인트 반환 (graceful fallback)
+#         return pts_rect, np.zeros(n, dtype=np.int32), 1
+
+#     labels = DBSCAN(eps=eps, min_samples=min_samples).fit(pts_rect).labels_
+#     unique_labels = sorted(set(labels.tolist()) - {-1})
+#     n_clusters = len(unique_labels)
+
+#     if n_clusters == 0:
+#         return pts_rect, labels, 0
+
+#     # 포인트 수 최대 클러스터 선택 (동률 시 z 최소)
+#     # cluster_sizes = {lbl: int((labels == lbl).sum()) for lbl in unique_labels}
+#     # max_size = max(cluster_sizes.values())
+#     # candidates = [lbl for lbl, sz in cluster_sizes.items() if sz == max_size]
+
+#     # if len(candidates) == 1:
+#     #     best_label = candidates[0]
+#     # else:
+#     #     best_label = min(
+#     #         candidates,
+#     #         key=lambda lbl: float(np.median(pts_rect[labels == lbl, 2])),
+#     #     )
+
+#     # return pts_rect[labels == best_label], labels, n_clusters
+#     cluster_z_medians = {lbl: float(np.median(pts_rect[labels == lbl, 2])) for lbl in unique_labels}
+#     best_label = min(cluster_z_medians, key=cluster_z_medians.get)
+
+#     return pts_rect[labels == best_label], labels, n_clusters
+
+# 파라미터에 expected_depth=None 추가
+def _dbscan_cluster(pts_rect: np.ndarray, eps=0.7, min_samples=3, min_points=3, expected_depth=None):
     """
     DBSCAN으로 frustum 포인트를 클러스터링하여 foreground 클러스터 선택.
-
-    선택 전략 (frustum-pointnets의 masking에 대응):
-      1. 포인트 수가 가장 많은 클러스터
-      2. 동률이면 depth(z) 중앙값이 가장 가까운 클러스터
-
-    Returns:
-        selected_pts: (M, 3) 선택된 클러스터 포인트
-        all_labels:   (N,)  클러스터 레이블 (-1 = noise)
-        n_clusters:   int
     """
     n = len(pts_rect)
     if n < min_points:
-        return pts_rect, np.zeros(n, dtype=np.int32), 0
+        return pts_rect, np.zeros(n, dtype=np.int32), 0, 0
 
     try:
         from sklearn.cluster import DBSCAN
     except ImportError:
-        # sklearn 없으면 전체 포인트 반환 (graceful fallback)
-        return pts_rect, np.zeros(n, dtype=np.int32), 1
+        return pts_rect, np.zeros(n, dtype=np.int32), 1, 0
 
     labels = DBSCAN(eps=eps, min_samples=min_samples).fit(pts_rect).labels_
     unique_labels = sorted(set(labels.tolist()) - {-1})
     n_clusters = len(unique_labels)
 
     if n_clusters == 0:
-        return pts_rect, labels, 0
+        return pts_rect, labels, 0, -1
 
-    # 포인트 수 최대 클러스터 선택 (동률 시 z 최소)
-    cluster_sizes = {lbl: int((labels == lbl).sum()) for lbl in unique_labels}
-    max_size = max(cluster_sizes.values())
-    candidates = [lbl for lbl, sz in cluster_sizes.items() if sz == max_size]
+    # 🚀 [새로운 로직] 각 클러스터의 Z(Depth) 중앙값 계산
+    # cluster_z_medians = {lbl: float(np.median(pts_rect[labels == lbl, 2])) for lbl in unique_labels}
 
-    if len(candidates) == 1:
-        best_label = candidates[0]
-    else:
-        best_label = min(
-            candidates,
-            key=lambda lbl: float(np.median(pts_rect[labels == lbl, 2])),
-        )
+    # if expected_depth is not None:
+    #     # [전략 2] YOLO 힌트가 있다면: 예상 거리(expected_depth)와 가장 오차가 적은 클러스터 선택
+    #     best_label = min(cluster_z_medians, key=lambda lbl: abs(cluster_z_medians[lbl] - expected_depth))
+    # else:
+    #     # [전략 1] 힌트가 없다면: 그냥 카메라에서 가장 가까운 클러스터 선택 (보험용)
+    #     best_label = min(cluster_z_medians, key=cluster_z_medians.get)
+    cluster_z_medians = {lbl: float(np.median(pts_rect[labels == lbl, 2])) for lbl in unique_labels}
+    best_label = min(cluster_z_medians, key=cluster_z_medians.get)
 
-    return pts_rect[labels == best_label], labels, n_clusters
-
-
+    return pts_rect[labels == best_label], labels, n_clusters, best_label
 # ─────────────────────────────────────────────────────────────
 # Heatmap BEV Grid Search (정밀 center + yaw 추정)
 # ─────────────────────────────────────────────────────────────
@@ -451,11 +515,23 @@ def generate_frustum_box(
         pts_normalized = _rotate_pc_along_y(pts_cam_in, rot_angle)
 
         # ── 3. DBSCAN 클러스터링 ──────────────────────────────
-        fg_pts, labels, n_clusters = _dbscan_cluster(
+        # 우선: 2D box 중앙 LiDAR 점의 실측 depth 사용
+        # fallback: bbox 크기 기반 geometric 추정
+        expected_depth = _estimate_depth_from_center_points(pts_cam_in, calib, bbox2d)
+        depth_source = "center_lidar"
+        if expected_depth is None:
+            expected_depth = _estimate_depth_from_bbox(cls_name, bbox2d, focal)
+            depth_source = "bbox_size"
+
+        if debug:
+            print(f"[FRUSTUM] expected depth: {expected_depth:.2f}m ({depth_source})")
+            
+        fg_pts, labels, n_clusters, best_label = _dbscan_cluster(
             pts_normalized,
             eps=dbscan_eps,
             min_samples=dbscan_min_samples,
             min_points=dbscan_min_points,
+            #expected_depth=expected_depth
         )
         n_fg = len(fg_pts)
 
@@ -578,7 +654,7 @@ def generate_frustum_box(
                   f"cx={cx:.2f} conf={final_conf:.4f}")
 
     x1, y1, x2, y2 = bbox2d
-    return {
+    result = {
         "cls_name":   cls_name,
         "cls_id":     _cls_name_to_id(cls_name),
         "truncated":  0.0,
@@ -590,6 +666,249 @@ def generate_frustum_box(
         "rotation_y": float(ry),
         "score":      float(final_conf),
     }
+
+    # 시각화용 클러스터 디버그 정보 (포인트가 있었던 경우만)
+    if n_pts >= dbscan_min_points:
+        result["_cluster_pts_cam"] = pts_cam_in       # (N, 3) camera rect 좌표
+        result["_cluster_labels"]  = labels            # (N,) DBSCAN 라벨 (-1=noise)
+        result["_cluster_selected"] = best_label       # 선택된 클러스터 라벨
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# Pedestrian Frustum Fallback (velodyne 좌표 기반)
+#   - /home/a/yolo/fusion/lgbm_3d_detect.py 방식 이식
+# ─────────────────────────────────────────────────────────────
+
+PED_ANCHOR_L = 0.8   # 고정 앵커 길이 [m]
+PED_ANCHOR_W = 0.7   # 고정 앵커 폭 [m]
+PED_GROUND_Z = -1.2  # velodyne Z-cut 지면 제거 임계값 [m]
+PED_DBSCAN_EPS = 1.0
+PED_DBSCAN_MIN_SAMPLES = 3
+PED_DILATION_RADIUS = 0.5
+PED_DILATION_RESOLUTION = 0.1
+
+
+def _cam_rect_to_velo(pts_rect: np.ndarray, calib) -> np.ndarray:
+    """카메라 직교 좌표 (N, 3) → velodyne 좌표 (N, 3)."""
+    # R0^-1 @ V2C^-1
+    R0 = calib.R0  # (3, 3)
+    V2C = calib.V2C  # (3, 4)
+    # 4x4 확장
+    R0_4 = np.eye(4, dtype=np.float64)
+    R0_4[:3, :3] = R0
+    V2C_4 = np.eye(4, dtype=np.float64)
+    V2C_4[:3, :] = V2C
+    T = np.linalg.inv(V2C_4) @ np.linalg.inv(R0_4)
+    N = len(pts_rect)
+    pts_hom = np.hstack([pts_rect[:, :3], np.ones((N, 1))])
+    pts_velo = (T @ pts_hom.T).T[:, :3]
+    return pts_velo
+
+
+def _velo_to_cam_rect(pts_velo: np.ndarray, calib) -> np.ndarray:
+    """velodyne 좌표 (N, 3) → 카메라 직교 좌표 (N, 3)."""
+    N = len(pts_velo)
+    pts_hom = np.hstack([pts_velo[:, :3], np.ones((N, 1), dtype=np.float32)])
+    return pts_hom @ (calib.V2C.T @ calib.R0.T)
+
+
+def _dilate_points_bev(pts, resolution=0.1, dilation_radius=0.5):
+    """BEV 모폴로지 팽창으로 점 연결성 향상. velodyne XY 평면 기준."""
+    if len(pts) == 0:
+        return np.zeros(0, dtype=bool)
+    xy = pts[:, :2]
+    xy_min = xy.min(axis=0) - dilation_radius
+    xy_max = xy.max(axis=0) + dilation_radius
+    grid_w = int(np.ceil((xy_max[1] - xy_min[1]) / resolution)) + 1
+    grid_h = int(np.ceil((xy_max[0] - xy_min[0]) / resolution)) + 1
+    if grid_w <= 0 or grid_h <= 0 or grid_w > 5000 or grid_h > 5000:
+        return np.ones(len(pts), dtype=bool)
+    grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+    row = np.clip(((xy[:, 0] - xy_min[0]) / resolution).astype(int), 0, grid_h - 1)
+    col = np.clip(((xy[:, 1] - xy_min[1]) / resolution).astype(int), 0, grid_w - 1)
+    grid[row, col] = 255
+    kernel_size = max(3, int(np.ceil(dilation_radius / resolution)) * 2 + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    dilated = cv2.dilate(grid, kernel, iterations=1)
+    return dilated[row, col] > 0
+
+
+def _ped_dbscan_cluster(pts_velo, eps=1.0, min_samples=3):
+    """
+    Pedestrian용 DBSCAN 클러스터링 (velodyne 좌표).
+    팽창 후 DBSCAN → 가장 가까운 클러스터 선택.
+
+    Returns:
+        cluster_pts: (M, 3) 선택된 클러스터 포인트 (velodyne)
+        all_labels: (N,) 전체 라벨
+        n_clusters: int
+        best_label: int
+    """
+    from sklearn.cluster import DBSCAN
+
+    n = len(pts_velo)
+    if n < min_samples:
+        return pts_velo, np.zeros(n, dtype=np.int32), 0, -1
+
+    # BEV 팽창
+    keep = _dilate_points_bev(pts_velo, resolution=PED_DILATION_RESOLUTION,
+                               dilation_radius=PED_DILATION_RADIUS)
+    dilated_pts = pts_velo[keep]
+    if len(dilated_pts) < min_samples:
+        return pts_velo, np.zeros(n, dtype=np.int32), 0, -1
+
+    labels_full = np.full(n, -1, dtype=np.int32)
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(dilated_pts[:, :3])
+    labels_dilated = db.labels_
+    labels_full[keep] = labels_dilated
+
+    unique_labels = sorted(set(labels_dilated.tolist()) - {-1})
+    n_clusters = len(unique_labels)
+    if n_clusters == 0:
+        return pts_velo, labels_full, 0, -1
+
+    # velodyne에서 X가 전방 → X median이 가장 작은(가장 가까운) 클러스터
+    cluster_x_medians = {}
+    for lbl in unique_labels:
+        mask = labels_full == lbl
+        cluster_x_medians[lbl] = float(np.median(pts_velo[mask, 0]))
+
+    best_label = min(cluster_x_medians, key=cluster_x_medians.get)
+    return pts_velo[labels_full == best_label], labels_full, n_clusters, best_label
+
+
+def generate_pedestrian_frustum_box(
+    points_lidar: np.ndarray,
+    calib,
+    yolo_det: dict,
+    near: float = 0.5,
+    far: float = 60.0,
+    debug: bool = False,
+) -> dict | None:
+    """
+    Pedestrian 전용 frustum fallback.
+    velodyne 좌표에서 ground removal → dilation → DBSCAN → 고정 앵커.
+
+    Returns:
+        KITTI 16-field 호환 dict, 또는 None
+    """
+    bbox2d = yolo_det["bbox"]
+    cls_name = yolo_det["cls_name"]
+    yolo_conf = float(yolo_det["score"])
+    focal = float(calib.P[0, 0])
+
+    # ── 1. Frustum 포인트 추출 (camera rect) ─────────────────
+    pts_lidar_in, pts_cam_in, depths_in = extract_frustum_points(
+        points_lidar, calib, bbox2d, near=near, far=far
+    )
+    n_pts = len(pts_lidar_in)
+
+    if debug:
+        print(f"[PED-FRUSTUM] frustum_pts={n_pts}")
+
+    if n_pts < PED_DBSCAN_MIN_SAMPLES:
+        # 포인트 부족 → bbox 크기 기반 depth fallback
+        depth = _estimate_depth_from_bbox(cls_name, bbox2d, focal)
+        if depth is None or not (near <= depth <= far):
+            return None
+        x1, y1, x2, y2 = bbox2d
+        u = (x1 + x2) / 2.0
+        fx = float(calib.P[0, 0])
+        cx_p = float(calib.P[0, 2])
+        cx = (u - cx_p) * depth / fx
+        cy = CAMERA_HEIGHT
+        cz = depth
+        prior = _get_class_prior(cls_name)
+        h, w, l = prior["h"], PED_ANCHOR_W, PED_ANCHOR_L
+        ry = 0.0
+        loc = [cx, cy, cz]
+        dims = [h, w, l]
+        final_conf = yolo_conf * 0.3 * 0.5
+        if debug:
+            print(f"[PED-FRUSTUM] SIZE-BASED depth={depth:.2f} conf={final_conf:.4f}")
+    else:
+        # ── 2. Camera rect → velodyne 변환 ───────────────────
+        pts_velo = _cam_rect_to_velo(pts_cam_in, calib)
+
+        # ── 3. Z-cut 지면 제거 ───────────────────────────────
+        ground_mask = pts_velo[:, 2] > PED_GROUND_Z
+        pts_velo_fg = pts_velo[ground_mask]
+
+        if debug:
+            print(f"[PED-FRUSTUM] after ground removal: {len(pts_velo_fg)}/{len(pts_velo)}")
+
+        if len(pts_velo_fg) < PED_DBSCAN_MIN_SAMPLES:
+            pts_velo_fg = pts_velo  # ground removal이 너무 많이 제거하면 원본 사용
+
+        # ── 4. BEV 팽창 + DBSCAN 클러스터링 ──────────────────
+        cluster_pts, labels, n_clusters, best_label = _ped_dbscan_cluster(
+            pts_velo_fg, eps=PED_DBSCAN_EPS, min_samples=PED_DBSCAN_MIN_SAMPLES
+        )
+
+        if debug:
+            print(f"[PED-FRUSTUM] DBSCAN: {n_clusters} clusters, "
+                  f"selected={len(cluster_pts)} pts")
+
+        if len(cluster_pts) == 0:
+            return None
+
+        # ── 5. 고정 앵커 배치 (velodyne BEV) ─────────────────
+        center_velo = cluster_pts[:, :3].mean(axis=0)  # (x, y, z) velodyne
+
+        # ── 6. Velodyne → camera rect 변환 ───────────────────
+        center_cam = _velo_to_cam_rect(center_velo.reshape(1, 3), calib)[0]
+        cx, cy, cz = float(center_cam[0]), float(center_cam[1]), float(center_cam[2])
+
+        # Y (camera down): 클러스터 하단 = 발 위치
+        cluster_cam = _velo_to_cam_rect(cluster_pts[:, :3], calib)
+        cy = float(cluster_cam[:, 1].max())  # 카메라 Y-down → max = 발
+
+        prior = _get_class_prior(cls_name)
+        h = prior["h"]
+        w = PED_ANCHOR_W
+        l = PED_ANCHOR_L
+        ry = 0.0  # Pedestrian: 방향 고정
+        loc = [cx, cy, cz]
+        dims = [h, w, l]
+
+        # Confidence
+        n_fg = len(cluster_pts)
+        if n_fg >= 10:
+            point_factor = 0.9
+        elif n_fg >= PED_DBSCAN_MIN_SAMPLES:
+            point_factor = 0.8
+        else:
+            point_factor = 0.6
+        final_conf = yolo_conf * point_factor
+
+        if debug:
+            print(f"[PED-FRUSTUM] center_cam=({cx:.1f},{cy:.1f},{cz:.1f}) "
+                  f"conf={final_conf:.4f}")
+
+    x1, y1, x2, y2 = bbox2d
+    result = {
+        "cls_name": cls_name,
+        "cls_id": _cls_name_to_id(cls_name),
+        "truncated": 0.0,
+        "occluded": 0,
+        "alpha": -10.0,
+        "bbox": [float(x1), float(y1), float(x2), float(y2)],
+        "dimensions": [float(dims[0]), float(dims[1]), float(dims[2])],
+        "location": [float(loc[0]), float(loc[1]), float(loc[2])],
+        "rotation_y": float(ry),
+        "score": float(final_conf),
+    }
+
+    # 시각화용 클러스터 디버그 정보 (ground removal 후 포인트 기준)
+    if n_pts >= PED_DBSCAN_MIN_SAMPLES:
+        pts_fg_cam = _velo_to_cam_rect(pts_velo_fg[:, :3], calib)
+        result["_cluster_pts_cam"] = pts_fg_cam
+        result["_cluster_labels"] = labels
+        result["_cluster_selected"] = best_label
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────

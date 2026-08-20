@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from io_utils import (
@@ -19,7 +20,8 @@ from io_utils import (
 from yolo_wrapper import YoloTRTDetector
 from matcher import match_pp_with_yolo, get_unmatched_yolo
 from score_fusion import calibrate_pp_scores
-from frustum_fallback import generate_frustum_box, filter_overlapping_fallbacks
+from frustum_fallback import generate_frustum_box, generate_pedestrian_frustum_box, filter_overlapping_fallbacks
+from pipeline_custom_eval import run_eval as run_custom_eval
 from visualize import save_fusion_vis
 
 # kitti_util은 tool/eval/ 아래에 있으므로 경로 추가
@@ -57,6 +59,27 @@ def load_gt_boxes(label_path):
                 "rotation_y": ry,
             })
     return boxes
+
+
+def _project_3d_box_to_image(box, P):
+    """GT/pred dict → 2D bbox [x1,y1,x2,y2] or None."""
+    cx, cy, cz = box["location"]
+    h, w, l = box["dimensions"]
+    ry = box["rotation_y"]
+    cos_r, sin_r = np.cos(ry), np.sin(ry)
+    R = np.array([[cos_r, 0, sin_r], [0, 1, 0], [-sin_r, 0, cos_r]])
+    xs = np.array([l/2, l/2, -l/2, -l/2, l/2, l/2, -l/2, -l/2])
+    ys = np.array([0, 0, 0, 0, -h, -h, -h, -h])
+    zs = np.array([w/2, -w/2, -w/2, w/2, w/2, -w/2, -w/2, w/2])
+    corners = R @ np.vstack([xs, ys, zs])
+    corners[0] += cx; corners[1] += cy; corners[2] += cz
+    if np.any(corners[2] < 0.1):
+        return None
+    pts_hom = np.vstack([corners, np.ones((1, 8))])
+    pts_2d = P @ pts_hom
+    pts_2d[:2] /= pts_2d[2:3]
+    return [float(pts_2d[0].min()), float(pts_2d[1].min()),
+            float(pts_2d[0].max()), float(pts_2d[1].max())]
 
 
 def get_fov_flag(points, calib, img_shape):
@@ -180,15 +203,15 @@ def run_pointpillars(project_root, velodyne_dir, pred_dir, skip_pp=False,
 
 def run_kitti_format(project_root, split_file="tool/eval/val.txt"):
     run_command(
-        ["python3", "tool/eval/kitti_format.py", "--split_file", split_file],
+        [sys.executable, "tool/eval/kitti_format.py", "--split_file", split_file],
         cwd=str(project_root),
     )
 
 
 def run_evaluate(project_root, result_path, max_dist=-1, pr_save_dir=None,
-                  split_file="tool/eval/val.txt"):
+                  split_file="tool/eval/val.txt", dist_bins=None):
     cmd = [
-        "python3",
+        sys.executable,
         "tool/eval/evaluate.py",
         "evaluate",
         "--label_path=data/kitti/training/label_2/",
@@ -199,6 +222,8 @@ def run_evaluate(project_root, result_path, max_dist=-1, pr_save_dir=None,
     ]
     if max_dist > 0:
         cmd.append(f"--max_dist={max_dist}")
+    if dist_bins:
+        cmd.append(f"--dist_bins={dist_bins}")   # 예: 0-10,10-20,20-30,0-30
     if pr_save_dir is not None:
         cmd.append(f"--pr_save_dir={pr_save_dir}")
     run_command(cmd, cwd=str(project_root))
@@ -230,6 +255,7 @@ def run_fusion(
     gamma=0.25,
     min_yolo_score=0.5,
     min_match_iou=0.5,
+    no_score_boost=False,
     max_frames=-1,
     debug=False,
     # ── Frustum Fallback ──────────────────────────
@@ -275,10 +301,18 @@ def run_fusion(
     total_frames = 0
     t_yolo_total = 0.0
     t_match_total = 0.0
+    t_frustum_total = 0.0
     t_total = 0.0
 
     # frustum fallback 통계
     fb_stats = {"frames": 0, "total": 0, "by_cls": {}, "dedup": 0}
+
+    # PP+YOLO 중간 결과 저장 디렉토리 (frustum 전)
+    pp_yolo_dir = project_root / "data/kitti/pred_pp_yolo"
+    ensure_dir(pp_yolo_dir)
+
+    # missed GT 수집 (시각화 + label_dir 있을 때만)
+    missed_gt_frames = {}  # frame_id → {"missed": [...], "matched": [...]}
 
     # frustum fallback 사용 시 필요한 경로 검증
     if frustum_fallback:
@@ -352,6 +386,35 @@ def run_fusion(
             if m["yolo_idx"] >= 0:
                 matched_yolo_indices.add(m["yolo_idx"])
 
+        # ── Missed GT 수집 (PP+YOLO only, frustum 전) ─────────
+        if label_dir is not None:
+            frame_gt = load_gt_boxes(label_dir / f"{frame_id}.txt")
+            if frame_gt:
+                missed = []
+                matched_gt = []
+                for gt in frame_gt:
+                    if gt["cls_name"] != "Pedestrian":
+                        continue
+                    gx, _, gz = gt["location"]
+                    is_matched = False
+                    for pred in fused_preds:
+                        if pred["cls_name"] != gt["cls_name"]:
+                            continue
+                        px, _, pz = pred["location"]
+                        if np.sqrt((gx - px)**2 + (gz - pz)**2) < 2.0:
+                            is_matched = True
+                            break
+                    (matched_gt if is_matched else missed).append(gt)
+                if missed:
+                    missed_gt_frames[frame_id] = {
+                        "missed": missed, "matched": matched_gt,
+                    }
+
+        # ── PP+YOLO 중간 결과 저장 (frustum 전) ─────────────
+        save_pp_predictions(fused_preds, pp_yolo_dir / f"{frame_id}.txt")
+
+        t_mid = time.perf_counter()  # matching 종료, frustum 시작 시점
+
         # ── Frustum Fallback ──────────────────────────────────
         n_fallback = 0
         if frustum_fallback:
@@ -360,6 +423,7 @@ def run_fusion(
             unmatched_yolo = [
                 (yi, yolo) for yi, yolo in unmatched_yolo
                 if float(yolo["score"]) >= min_yolo_score_fallback
+                and yolo["cls_name"] == "Pedestrian"  # Pedestrian만 fallback
             ]
 
             if unmatched_yolo:
@@ -372,15 +436,10 @@ def run_fusion(
 
                     raw_fallbacks = []
                     for yi, yolo_det in unmatched_yolo:
-                        box = generate_frustum_box(
+                        box = generate_pedestrian_frustum_box(
                             points, calib, yolo_det,
                             near=frustum_near,
                             far=frustum_far,
-                            dbscan_eps=dbscan_eps,
-                            dbscan_min_samples=dbscan_min_samples,
-                            heatmap_grid_size=heatmap_grid_size,
-                            heatmap_yaw_step=heatmap_yaw_step,
-                            depth_bin_size=frustum_bin_size,
                             debug=debug,
                         )
                         if box is not None:
@@ -416,6 +475,17 @@ def run_fusion(
             gt_boxes = None
             if label_dir is not None:
                 gt_boxes = load_gt_boxes(label_dir / f"{frame_id}.txt")
+
+            # 포인트 클라우드 로드 (frustum에서 이미 로드한 경우 재사용)
+            vis_points = None
+            vis_calib  = None
+            if velodyne_dir is not None and calib_dir is not None:
+                bin_path   = Path(velodyne_dir) / f"{frame_id}.bin"
+                calib_path = Path(calib_dir) / f"{frame_id}.txt"
+                if bin_path.exists() and calib_path.exists():
+                    vis_points = np.fromfile(str(bin_path), dtype=np.float32).reshape(-1, 4)
+                    vis_calib  = kitti_util.Calibration(str(calib_path))
+
             save_fusion_vis(
                 img_path=img_path,
                 yolo_preds=yolo_preds,
@@ -426,11 +496,14 @@ def run_fusion(
                 bev_x_range=bev_x_range,
                 bev_z_range=bev_z_range,
                 gt_boxes=gt_boxes,
+                points=vis_points,
+                calib=vis_calib,
             )
 
-        t_yolo_total  += (t1 - t0)
-        t_match_total += (t2 - t1)
-        t_total       += (t2 - t0)
+        t_yolo_total    += (t1 - t0)
+        t_match_total   += (t_mid - t1)
+        t_frustum_total += (t2 - t_mid)
+        t_total         += (t2 - t0)
         total_frames  += 1
 
         if idx % 50 == 0 or debug:
@@ -458,17 +531,55 @@ def run_fusion(
         n_vis = fb_stats["frames"] if not vis_all else total_frames
         print(f"[VIS] {n_vis} frames saved to {vis_dir}")
 
+    # ── Missed GT 시각화 저장 ────────────────────────────────
+    if missed_gt_frames and label_dir is not None:
+        missed_dir = save_dir / "debug_missed"
+        ensure_dir(missed_dir)
+        total_missed = sum(len(v["missed"]) for v in missed_gt_frames.values())
+        total_matched = sum(len(v["matched"]) for v in missed_gt_frames.values())
+        print(f"\n[MISSED GT] {total_missed} missed / "
+              f"{total_missed + total_matched} total GT "
+              f"({len(missed_gt_frames)} frames)")
+
+        for fid, data in missed_gt_frames.items():
+            img_path = project_root / image_dir / f"{fid}.png"
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+
+            calib_path = calib_dir / f"{fid}.txt" if calib_dir is not None else None
+            P = kitti_util.Calibration(str(calib_path)).P if calib_path and calib_path.exists() else None
+
+            for gt in data["missed"]:
+                if P is not None:
+                    bbox2d = _project_3d_box_to_image(gt, P)
+                    if bbox2d:
+                        x1, y1, x2, y2 = [int(v) for v in bbox2d]
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                        loc = gt["location"]
+                        lbl = f"MISS:{gt['cls_name'][:3]} z={loc[2]:.1f}m"
+                        cv2.putText(img, lbl, (x1, y1 - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                    (0, 0, 255), 1, cv2.LINE_AA)
+
+            info = f"{fid}  missed:{len(data['missed'])}  matched:{len(data['matched'])}"
+            cv2.putText(img, info, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.imwrite(str(missed_dir / f"{fid}.png"), img)
+
+        print(f"[MISSED GT] Saved {len(missed_gt_frames)} images → {missed_dir}/")
+
     if total_frames > 0:
-        avg_yolo  = t_yolo_total  / total_frames * 1000
-        avg_match = t_match_total / total_frames * 1000
-        avg_total = t_total       / total_frames * 1000
-        fps       = total_frames  / t_total
+        avg_yolo    = t_yolo_total    / total_frames * 1000
+        avg_match   = t_match_total   / total_frames * 1000
+        avg_frustum = t_frustum_total / total_frames * 1000
+        avg_total   = t_total         / total_frames * 1000
         print(f"\n[TIMING] YOLO+Fusion  frames={total_frames}")
         print(f"  YOLO inference : {avg_yolo:.2f} ms/frame")
-        print(f"  Match + Fusion : {avg_match:.2f} ms/frame")
+        print(f"  Match + Score  : {avg_match:.2f} ms/frame")
+        print(f"  Frustum fallbk : {avg_frustum:.2f} ms/frame")
         print(f"  YOLO+Fusion    : {avg_total:.2f} ms/frame")
-        print(f"  FPS (YOLO+Fusion only): {fps:.1f}")
-        return avg_total, total_frames
+        return (avg_yolo, avg_match, avg_frustum), total_frames
     return None, 0
 
 
@@ -523,6 +634,12 @@ def main():
         default=-1,
         help="Evaluate only objects within this distance (camera z, meters). -1 = no limit.",
     )
+    parser.add_argument(
+        "--dist_bins",
+        type=str,
+        default="0-10,10-20,20-30,0-30",
+        help="표준 KITTI 거리 구간별(radial) 평가 구간. 빈 문자열이면 비활성화.",
+    )
 
     # ── Frustum Fallback ──────────────────────────────────────
     parser.add_argument(
@@ -539,7 +656,7 @@ def main():
     parser.add_argument(
         "--frustum_far",
         type=float,
-        default=60.0,
+        default=40.0,
         help="Frustum far plane 깊이 (m)",
     )
     parser.add_argument(
@@ -557,13 +674,13 @@ def main():
     parser.add_argument(
         "--dbscan_eps",
         type=float,
-        default=0.7,
+        default=0.4,
         help="DBSCAN 이웃 반경 [m] (frustum 클러스터링)",
     )
     parser.add_argument(
         "--dbscan_min_samples",
         type=int,
-        default=3,
+        default=2,
         help="DBSCAN 코어 포인트 최소 이웃 수",
     )
     parser.add_argument(
@@ -596,6 +713,12 @@ def main():
         type=str,
         default="/home/a/OpenPCDet_my/data/kitti/training/label_2",
         help="GT label 디렉토리 (BEV IoU 표시용). 미지정 시 IoU 표시 안 함.",
+    )
+    parser.add_argument(
+        "--custom_eval_score_thr",
+        type=float,
+        default=0.3,
+        help="Custom BEV evaluation 최소 confidence score threshold",
     )
 
     args = parser.parse_args()
@@ -631,7 +754,7 @@ def main():
     if not args.skip_baseline_eval:
         print("[INFO] Step 4: Evaluate baseline PP")
         run_evaluate(project_root, "data/kitti/pred_baseline", max_dist=args.max_dist,
-                     split_file=args.split_file)
+                     split_file=args.split_file, dist_bins=args.dist_bins)
 
     # BEV 시각화 범위: max_dist 기반 자동 설정
     if args.max_dist > 0:
@@ -642,7 +765,7 @@ def main():
         bev_x = (-30, 30)
 
     print("[INFO] Step 5: Run YOLO + Fusion")
-    yolo_ms_per_frame, yolo_num_frames = run_fusion(
+    fusion_timing, yolo_num_frames = run_fusion(
         project_root=project_root,
         yolo_engine=args.yolo_engine,
         image_dir=args.image_dir,
@@ -681,17 +804,66 @@ def main():
         print("[INFO] Step 6: Evaluate fused PP")
         pr_save = str(project_root / args.save_dir / "pr_curves")
         run_evaluate(project_root, args.save_dir, max_dist=args.max_dist,
-                     pr_save_dir=pr_save, split_file=args.split_file)
+                     pr_save_dir=pr_save, split_file=args.split_file,
+                     dist_bins=args.dist_bins)
 
-    if pp_ms_per_frame is not None and yolo_ms_per_frame is not None:
-        total_ms = pp_ms_per_frame + yolo_ms_per_frame
-        print(f"\n{'='*50}")
-        print(f"[TIMING] Full pipeline summary")
-        print(f"  PointPillars   : {pp_ms_per_frame:.2f} ms/frame")
-        print(f"  YOLO + Fusion  : {yolo_ms_per_frame:.2f} ms/frame")
-        print(f"  Total          : {total_ms:.2f} ms/frame")
-        print(f"  Pipeline FPS   : {1000/total_ms:.1f}")
-        print(f"{'='*50}")
+    if fusion_timing is not None:
+        avg_yolo, avg_match, avg_frustum = fusion_timing
+        pp_ms = pp_ms_per_frame  # None if --skip_pp
+
+        print(f"\n{'='*65}")
+        print(f"[TIMING] Per-frame breakdown")
+        print(f"{'='*65}")
+        if pp_ms is not None:
+            print(f"  PointPillars     : {pp_ms:.2f} ms")
+        else:
+            print(f"  PointPillars     : (skipped, not measured)")
+        print(f"  YOLO inference   : {avg_yolo:.2f} ms")
+        print(f"  Match + Score    : {avg_match:.2f} ms")
+        print(f"  Frustum fallback : {avg_frustum:.2f} ms")
+        print(f"{'─'*65}")
+        print(f"  {'Method':<30} {'ms/frame':>10} {'FPS':>8}")
+        print(f"{'─'*65}")
+        if pp_ms is not None:
+            ms_pp_only       = pp_ms
+            ms_pp_yolo       = pp_ms + avg_yolo + avg_match
+            ms_pp_yolo_frust = pp_ms + avg_yolo + avg_match + avg_frustum
+            print(f"  {'1. PP only':<30} {ms_pp_only:>10.2f} {1000/ms_pp_only:>8.1f}")
+            print(f"  {'2. PP + YOLO':<30} {ms_pp_yolo:>10.2f} {1000/ms_pp_yolo:>8.1f}")
+            print(f"  {'3. PP + YOLO + Frustum':<30} {ms_pp_yolo_frust:>10.2f} {1000/ms_pp_yolo_frust:>8.1f}")
+        else:
+            ms_yolo_match    = avg_yolo + avg_match
+            ms_yolo_frustum  = avg_yolo + avg_match + avg_frustum
+            print(f"  {'1. PP only':<30} {'N/A (--skip_pp)':>10}")
+            print(f"  {'2. PP + YOLO (YOLO part)':<30} {ms_yolo_match:>10.2f} {1000/ms_yolo_match:>8.1f}")
+            print(f"  {'3. PP+YOLO+Frust (YOLO part)':<30} {ms_yolo_frustum:>10.2f} {1000/ms_yolo_frustum:>8.1f}")
+            print(f"  (PP 시간을 포함하려면 --skip_pp 없이 실행하세요)")
+        print(f"{'='*65}")
+
+    # ── Step 7: Custom BEV Evaluation (거리별 포함) ─────────────
+    eval_max_dist = args.max_dist if args.max_dist > 0 else 30.0
+    eval_kwargs = dict(
+        label_dir=args.label_dir,
+        calib_dir=args.calib_dir,
+        split_file=args.split_file,
+        max_dist=eval_max_dist,
+        score_thr=args.custom_eval_score_thr,
+    )
+
+    print("\n" + "=" * 75)
+    print("[INFO] Step 7-1: Custom BEV Eval — PointPillar ONLY")
+    print("=" * 75)
+    run_custom_eval(pred_dir=str(project_root / "data/kitti/pred_baseline"), **eval_kwargs)
+
+    print("\n" + "=" * 75)
+    print("[INFO] Step 7-2: Custom BEV Eval — PointPillar + YOLO")
+    print("=" * 75)
+    run_custom_eval(pred_dir=str(project_root / "data/kitti/pred_pp_yolo"), **eval_kwargs)
+
+    print("\n" + "=" * 75)
+    print("[INFO] Step 7-3: Custom BEV Eval — PointPillar + YOLO + Frustum")
+    print("=" * 75)
+    run_custom_eval(pred_dir=str(project_root / args.save_dir), **eval_kwargs)
 
     print("[INFO] Pipeline finished successfully.")
 
